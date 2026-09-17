@@ -129,6 +129,7 @@ cd Block-Sparse-Attention
 pip install packaging
 pip install ninja
 python setup.py install
+BLOCK_SPARSE_ATTN_CUDA_ARCHS="90" python setup.py install
 ```
 
 #### 4️⃣ Download Model Weights from Hugging Face

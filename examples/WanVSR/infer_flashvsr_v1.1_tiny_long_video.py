@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, time
+import csv, os, re, time
 import numpy as np
 from PIL import Image
 import imageio
 from tqdm import tqdm
 import torch
+from torch.profiler import profile, ProfilerActivity
 from einops import rearrange
 
 from diffsynth import ModelManager, FlashVSRTinyLongPipeline
@@ -179,31 +180,100 @@ def init_pipeline():
     print(torch.cuda.current_device(), torch.cuda.get_device_name(torch.cuda.current_device()))
     mm = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
     mm.load_models([
-        "./FlashVSR-v1.1/diffusion_pytorch_model_streaming_dmd.safetensors",
+        "/cx8k/fs101/wzp/code/0929/FlashVSR/examples/WanVSR/FlashVSR-v1.1/diffusion_pytorch_model_streaming_dmd.safetensors",
     ])
     pipe = FlashVSRTinyLongPipeline.from_model_manager(mm, device="cuda")
     pipe.denoising_model().LQ_proj_in = Causal_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to("cuda", dtype=torch.bfloat16)
-    LQ_proj_in_path = "./FlashVSR-v1.1/LQ_proj_in.ckpt"
+    LQ_proj_in_path = "/cx8k/fs101/wzp/code/0929/FlashVSR/examples/WanVSR/FlashVSR-v1.1/LQ_proj_in.ckpt"
     if os.path.exists(LQ_proj_in_path):
         pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(LQ_proj_in_path, map_location="cpu"), strict=True)
     pipe.denoising_model().LQ_proj_in.to('cuda')
 
     multi_scale_channels = [512, 256, 128, 128]
     pipe.TCDecoder = build_tcdecoder(new_channels=multi_scale_channels, new_latent_channels=16+768)
-    mis = pipe.TCDecoder.load_state_dict(torch.load("./FlashVSR-v1.1/TCDecoder.ckpt"), strict=False)
+    mis = pipe.TCDecoder.load_state_dict(torch.load("/cx8k/fs101/wzp/code/0929/FlashVSR/examples/WanVSR/FlashVSR-v1.1/TCDecoder.ckpt"), strict=False)
     print(mis)
 
     pipe.to('cuda'); pipe.enable_vram_management(num_persistent_param_in_dit=None)
     pipe.init_cross_kv(); pipe.load_models_to_device(["dit","vae"])
     return pipe
 
+# ---- 算子追踪配置（默认关闭，避免增加推理开销）----
+# FLASHVSR_PROFILE=1 时，对单次 pipe 前向推理做 CPU+CUDA 算子级 profile，
+# 打印带 input shapes 的算子表格，并导出 chrome trace。
+PROFILE = os.environ.get("FLASHVSR_PROFILE", "0") == "1"
+PROFILE_OUT = os.environ.get("FLASHVSR_PROFILE_OUT", "./profile_trace.json")
+PROFILE_CSV_OUT = os.environ.get("FLASHVSR_PROFILE_CSV_OUT", "./profile_ops.csv")
+PROFILE_ROWS = int(os.environ.get("FLASHVSR_PROFILE_ROWS", "200"))
+
+def export_ops_csv(events, path, row_limit=200):
+    """把 profile events() 按算子名聚合（含 input shapes），按 CUDA 时间降序写成 CSV。"""
+    agg = {}
+    for e in events:
+        name = getattr(e, "name", None) or getattr(e, "key", "")
+        if name not in agg:
+            agg[name] = {
+                "device": "", "count": 0,
+                "self_cpu": 0.0, "cpu_total": 0.0,
+                "self_cuda": 0.0, "cuda_total": 0.0,
+                "mem": 0, "shapes": set(),
+            }
+        a = agg[name]
+        a["count"] += getattr(e, "count", 1) or 1
+        a["self_cpu"] += getattr(e, "self_cpu_time_total", 0.0) or 0.0
+        a["cpu_total"] += getattr(e, "cpu_time_total", 0.0) or 0.0
+        a["self_cuda"] += getattr(e, "self_device_time_total", 0.0) or 0.0
+        a["cuda_total"] += getattr(e, "device_time_total", 0.0) or 0.0
+        a["mem"] = max(a["mem"], getattr(e, "self_device_memory_usage", 0) or 0)
+        a["device"] = str(getattr(e, "device_type", "") or "")
+        shapes = getattr(e, "input_shapes", None)
+        if shapes:
+            a["shapes"].add(str(shapes))
+
+    rows = sorted(agg.items(), key=lambda kv: (kv[1]["cuda_total"], kv[0]), reverse=True)
+    rows = rows[:row_limit]
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "name", "device", "count",
+            "self_cpu_us", "cpu_total_us",
+            "self_cuda_us", "cuda_total_us",
+            "device_memory_bytes", "input_shapes",
+        ])
+        for name, a in rows:
+            w.writerow([
+                name, a["device"], a["count"],
+                round(a["self_cpu"], 3), round(a["cpu_total"], 3),
+                round(a["self_cuda"], 3), round(a["cuda_total"], 3),
+                a["mem"], " | ".join(sorted(a["shapes"])),
+            ])
+
+
+def run_inference(pipe, LQ, th, tw, F, seed, sparse_ratio):
+    return pipe(
+        prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed,
+        LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
+        topk_ratio=sparse_ratio*768*1280/(th*tw),
+        kv_ratio=3.0,
+        local_range=11,  # Recommended: 9 or 11. local_range=9 → sharper details; 11 → more stable results.
+        color_fix=True,
+    )
+
 def main():
+    t0 = time.time()
     RESULT_ROOT = "./results"
     os.makedirs(RESULT_ROOT, exist_ok=True)
     inputs = [
-        "./inputs/example4.mp4",
+        # "./inputs/example4.mp4",
+        # "/cx8k/fs101/wzp/code/0929/FlashVSR/examples/WanVSR/inputs/example0.mp4",
+        # "/cx8k/fs101/wzp/code/0929/FlashVSR/1080p.mp4",
+        # "/workspace/ComfyUI/custom_nodes/FlashVSR/bg_video_720p.mp4",
+        "/cx8k/fs101/wzp/code/0929/FlashVSR/bg_video_720p.mp4",
+        # "/cx8k/fs101/wzp/code/0929/FlashVSR/bg_video_720p.mp4",
+        # "/cx8k/fs101/wzp/code/0929/FlashVSR/frame-stitched-video_768p.mp4"
     ]
-    seed, scale, dtype, device = 0, 4.0, torch.bfloat16, 'cuda'
+    seed, scale, dtype, device = 0, 2.0, torch.bfloat16, 'cuda'
     sparse_ratio = 2.0      # Recommended: 1.5 or 2.0. 1.5 → faster; 2.0 → more stable.
     pipe = init_pipeline()
 
@@ -217,19 +287,51 @@ def main():
         except Exception as e:
             print(f"[Error] {name}: {e}"); continue
 
-        video = pipe(
-            prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed,
-            LQ_video=LQ, num_frames=F, height=th, width=tw, is_full_block=False, if_buffer=True,
-            topk_ratio=sparse_ratio*768*1280/(th*tw), 
-            kv_ratio=3.0,
-            local_range=11,  # Recommended: 9 or 11. local_range=9 → sharper details; 11 → more stable results.
-            color_fix = True,
-        )
+        if PROFILE:
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True,
+                profile_memory=True,
+            ) as prof:
+                video = run_inference(pipe, LQ, th, tw, F, seed, sparse_ratio)
+            ka = prof.key_averages()
+            print(ka.table(sort_by="cuda_time_total", row_limit=PROFILE_ROWS))
+            export_ops_csv(prof.events(), PROFILE_CSV_OUT, PROFILE_ROWS)
+            print(f"[Profile] operator table saved to {PROFILE_CSV_OUT}")
+            prof.export_chrome_trace(PROFILE_OUT)
+            print(f"[Profile] chrome trace saved to {PROFILE_OUT}")
+        else:
+            video = run_inference(pipe, LQ, th, tw, F, seed, sparse_ratio)
 
         video = tensor2video(video)
         save_video(video, os.path.join(RESULT_ROOT, f"FlashVSR_v1.1_Tiny_Long_{name.split('.')[0]}_seed{seed}.mp4"), fps=fps, quality=5)
 
-    print("Done.")
+    print(f"Done. time: {time.time() - t0}")
 
 if __name__ == "__main__":
     main()
+
+
+'''
+CUDA_VISIBLE_DEVICES=2 python infer_flashvsr_v1.1_tiny_long_video.py
+
+1080p, 36s
+
+-> 2x 
+7min
+
+-> 4x
+out mem
+
+-----------------------------
+720p, 27s
+
+-> 2x 
+3min
+
+-----------------------------
+768p, 3min
+
+-> 2x 
+18min
+'''

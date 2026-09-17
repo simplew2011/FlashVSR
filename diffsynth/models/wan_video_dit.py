@@ -560,7 +560,8 @@ class WanModel(torch.nn.Module):
         self.head = Head(dim, out_dim, patch_size, eps)
 
         head_dim = dim // num_heads
-        self.freqs = precompute_freqs_cis_3d(head_dim)
+        # end 需覆盖最长视频的潜变量帧数（默认 1024 仅够 ~4096 视频帧，超长视频越界切片会产生空 freqs）
+        self.freqs = precompute_freqs_cis_3d(head_dim, end=10240)
 
         self._cross_kv_initialized = False
 
