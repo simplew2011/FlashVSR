@@ -17,16 +17,20 @@ color_fix=True、is_full_block=False、if_buffer=True、topk_ratio=sparse_ratio*
 """
 from __future__ import annotations
 
+import argparse
 import gc
 import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -36,6 +40,7 @@ from typing import Any, Callable, Literal, Optional
 import imageio
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 # block_sparse_attn（由 diffsynth 间接导入）动态链接 torch 的 libc10.so，
@@ -73,10 +78,12 @@ MODEL_DIR = Path(os.environ.get("FLASHVSR_MODEL_DIR", str(DEFAULT_MODEL_DIR)))
 WORK_DIR = Path(os.environ.get("FLASHVSR_WORK_DIR", str(BASE_DIR / ".flashvsr_server")))
 ENCODER = os.environ.get("FLASHVSR_ENCODER", "auto")
 MAX_QUEUE = int(os.environ.get("FLASHVSR_MAX_QUEUE", "8"))
-MAX_TARGET_PIXELS = int(os.environ.get("FLASHVSR_MAX_TARGET_PIXELS", "4500000"))
 MAX_TARGET_PIXELS = int(os.environ.get("FLASHVSR_MAX_TARGET_PIXELS", "14500000"))
 ENCODE_CHUNK = int(os.environ.get("FLASHVSR_ENCODE_CHUNK", "4"))
 API_KEY = os.environ.get("FLASHVSR_API_KEY", "")
+TILED_DIT = os.environ.get("FLASHVSR_TILED_DIT", "0") == "1"
+TILE_SIZE = int(os.environ.get("FLASHVSR_TILE_SIZE", "256"))
+TILE_OVERLAP = int(os.environ.get("FLASHVSR_TILE_OVERLAP", "24"))
 MODEL_NAME = "FlashVSR-v1.1-Tiny-Long"
 MODEL_CREATED = int(time.time())
 
@@ -91,13 +98,73 @@ TERMINAL = {"completed", "failed", "cancelled"}
 
 
 # --------------------------------------------------------------------------
+# 单行进度条：在终端里用 \r 原地刷新，避免与日志/内部 tqdm 交错刷出多行。
+# 非终端（重定向到文件/管道）时退化为原有的周期日志行。
+# --------------------------------------------------------------------------
+_IS_TTY = sys.stderr.isatty()
+_progress_line_active = False
+
+
+def _write_progress_line(text: str) -> None:
+    global _progress_line_active
+    width = shutil.get_terminal_size((120, 20)).columns
+    if len(text) >= width:
+        text = text[: width - 1]
+    sys.stderr.write("\r" + text + "\x1b[K")
+    sys.stderr.flush()
+    _progress_line_active = True
+
+
+def _finish_progress_line() -> None:
+    """结束当前单行进度（换行），确保后续日志/输出另起一行。"""
+    global _progress_line_active
+    if _progress_line_active:
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+        _progress_line_active = False
+
+
+_PROGRESS_BAR_MIN = 20
+
+
+def _short_job_id(job_id: str) -> str:
+    """取任务 id 尾部 _六位hex_倍率x（如 8e0740_3x），便于单行内辨识。"""
+    parts = job_id.rsplit("_", 2)
+    return "_".join(parts[-2:]) if len(parts) >= 3 else job_id[-12:]
+
+
+def _format_progress(job_id: str, phase: str, progress: float, elapsed: float,
+                     width: Optional[int] = None) -> str:
+    """把进度条拉到终端整宽：条长 = 终端宽 - 前缀 - 后缀。"""
+    if width is None:
+        width = shutil.get_terminal_size((120, 20)).columns
+    pct = max(0.0, min(100.0, float(progress)))
+    head = f"job {_short_job_id(job_id)} {phase:12s} |"
+    tail = f"| {pct:5.1f}% ({elapsed:.0f}s)"
+    bar_w = max(_PROGRESS_BAR_MIN, width - len(head) - len(tail) - 1)
+    filled = int(bar_w * pct / 100.0)
+    bar = "█" * filled + " " * (bar_w - filled)
+    return head + bar + tail
+
+
+# --------------------------------------------------------------------------
 # 日志
 # --------------------------------------------------------------------------
 LOG_LEVEL = os.environ.get("FLASHVSR_LOG_LEVEL", "INFO").upper()
 logger = logging.getLogger("flashvsr")
 logger.setLevel(LOG_LEVEL)
+
+
+class _ProgressSafeHandler(logging.StreamHandler):
+    """打印日志前先结束单行进度，避免日志与进度条叠在同一行。"""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        _finish_progress_line()
+        super().emit(record)
+
+
 if not logger.handlers:
-    _handler = logging.StreamHandler()
+    _handler = _ProgressSafeHandler()
     _handler.setFormatter(logging.Formatter(
         "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -124,6 +191,15 @@ def _to_unix(ts: Optional[str]) -> Optional[int]:
         return None
     try:
         return int(datetime.fromisoformat(str(ts)).timestamp())
+    except (ValueError, TypeError):
+        return None
+
+
+def _epoch(ts: Optional[str]) -> Optional[float]:
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts)).timestamp()
     except (ValueError, TypeError):
         return None
 
@@ -188,7 +264,7 @@ def is_video(path):
 
 
 def pil_to_tensor_neg1_1(img: Image.Image, dtype=torch.bfloat16, device="cpu"):
-    t = torch.from_numpy(np.asarray(img, np.uint8)).to(device=device, dtype=torch.float32)
+    t = torch.from_numpy(np.array(img, np.uint8)).to(device=device, dtype=torch.float32)
     t = t.permute(2, 0, 1) / 255.0 * 2.0 - 1.0
     return t.to(dtype)
 
@@ -213,7 +289,7 @@ def upscale_then_center_crop(img: Image.Image, scale: float, tW: int, tH: int) -
     sH = int(round(h0 * scale))
     if tW > sW or tH > sH:
         raise ValueError(f"Target crop ({tW}x{tH}) exceeds scaled size ({sW}x{sH}). Increase scale.")
-    up = img.resize((sW, sH), Image.BICUBIC)
+    up = img.resize((sW, sH), Image.Resampling.BICUBIC)
     l = (sW - tW) // 2
     t = (sH - tH) // 2
     return up.crop((l, t, l + tW, t + tH))
@@ -225,6 +301,139 @@ def ceil_8n1(n: int) -> int:
     while m % 8 != 1:
         m += 1
     return m
+
+
+# --------------------------------------------------------------------------
+# tiled_dit：把输入帧在空间上切成重叠瓦片分别跑 DiT，再羽化融合回整幅。
+# 参考 ComfyUI-FlashVSR_Ultra_Fast。逐瓦片推理使每块 KV 缓存 ∝ 瓦片面积，
+# 显著降低长视频/高倍率的显存峰值（代价是速度）。
+# --------------------------------------------------------------------------
+def calculate_tile_coords(height: int, width: int, tile_size: int, overlap: int) -> list[tuple[int, int, int, int]]:
+    coords: list[tuple[int, int, int, int]] = []
+    stride = max(1, tile_size - overlap)
+    num_rows = math.ceil((height - overlap) / stride)
+    num_cols = math.ceil((width - overlap) / stride)
+    for r in range(num_rows):
+        for c in range(num_cols):
+            y1 = r * stride
+            x1 = c * stride
+            y2 = min(y1 + tile_size, height)
+            x2 = min(x1 + tile_size, width)
+            if y2 - y1 < tile_size:
+                y1 = max(0, y2 - tile_size)
+            if x2 - x1 < tile_size:
+                x1 = max(0, x2 - tile_size)
+            coords.append((x1, y1, x2, y2))
+    return coords
+
+
+def create_feather_mask(size: tuple[int, int], overlap: int) -> torch.Tensor:
+    """生成 (1,1,H,W) 的羽化权重（边缘线性渐隐），用于瓦片边界融合。"""
+    H, W = size
+    overlap = max(1, min(int(overlap), H // 2, W // 2))
+    mask = torch.ones(1, 1, H, W)
+    ramp = torch.linspace(0, 1, overlap + 1)[1:]
+    mask[:, :, :, :overlap] = torch.minimum(mask[:, :, :, :overlap], ramp.view(1, 1, 1, -1))
+    mask[:, :, :, -overlap:] = torch.minimum(mask[:, :, :, -overlap:], ramp.flip(0).view(1, 1, 1, -1))
+    mask[:, :, :overlap, :] = torch.minimum(mask[:, :, :overlap, :], ramp.view(1, 1, -1, 1))
+    mask[:, :, -overlap:, :] = torch.minimum(mask[:, :, -overlap:, :], ramp.flip(0).view(1, 1, -1, 1))
+    return mask
+
+
+def decode_source_frames(path: str, cancel_check: Optional[Callable[[], bool]] = None):
+    """把输入（视频或图片目录）解码为 CPU uint8 张量 (F,H,W,3)。
+
+    tiled_dit 需要先拿到原始分辨率的完整帧序列，再按空间瓦片切分；因此这里一次性
+    解码（非流式），返回 (frames, w0, h0, fps, total)。
+    """
+    if os.path.isdir(path):
+        paths0 = list_images_natural(path)
+        if not paths0:
+            raise FileNotFoundError(f"No images in {path}")
+        with Image.open(paths0[0]) as _img0:
+            w0, h0 = _img0.size
+        total = len(paths0)
+        arrs = []
+        for p in paths0:
+            if cancel_check is not None and cancel_check():
+                raise InferenceCancelled("prepare cancelled")
+            with Image.open(p).convert("RGB") as img:
+                arrs.append(np.array(img, np.uint8))
+        return torch.from_numpy(np.stack(arrs, 0)), w0, h0, 30, total
+
+    if is_video(path):
+        rdr = imageio.get_reader(path)
+        first = Image.fromarray(rdr.get_data(0)).convert("RGB")
+        w0, h0 = first.size
+        meta = {}
+        try:
+            meta = rdr.get_meta_data()
+        except Exception:
+            pass
+        fps_val = meta.get("fps", 30)
+        fps = int(round(fps_val)) if isinstance(fps_val, (int, float)) else 30
+
+        def count_frames(r):
+            try:
+                nf = meta.get("nframes", None)
+                if isinstance(nf, int) and nf > 0:
+                    return nf
+            except Exception:
+                pass
+            try:
+                return r.count_frames()
+            except Exception:
+                n = 0
+                try:
+                    while True:
+                        r.get_data(n)
+                        n += 1
+                except Exception:
+                    return n
+
+        total = count_frames(rdr)
+        if total <= 0:
+            rdr.close()
+            raise RuntimeError(f"Cannot read frames from {path}")
+        arrs = []
+        try:
+            for i in range(total):
+                if cancel_check is not None and cancel_check():
+                    raise InferenceCancelled("prepare cancelled")
+                arrs.append(np.array(Image.fromarray(rdr.get_data(i)).convert("RGB"), np.uint8))
+        finally:
+            try:
+                rdr.close()
+            except Exception:
+                pass
+        return torch.from_numpy(np.stack(arrs, 0)), w0, h0, fps, total
+
+    raise ValueError(f"Unsupported input: {path}")
+
+
+def prepare_tile_lq(frames: torch.Tensor, scale: float = 4.0, dtype: Any = torch.bfloat16,
+                    cancel_check: Optional[Callable[[], bool]] = None):
+    """对单个空间瓦片的帧序列做 bicubic 放大 + 128 倍数中心裁剪 + 8n+1 补帧。
+
+    frames: (F,h,w,3) uint8 CPU。返回 (vid 1,C,F,tH,tW, tH, tW, padded)。
+    """
+    F0, h0, w0, _ = frames.shape
+    _, _, tW, tH = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=128)
+    sW, sH = int(round(w0 * scale)), int(round(h0 * scale))
+    padded = ceil_8n1(F0 + 4)
+    idx = list(range(F0)) + [F0 - 1] * (padded - F0)
+    out = []
+    for i in idx:
+        if cancel_check is not None and cancel_check():
+            raise InferenceCancelled("prepare cancelled")
+        t = frames[i].to(torch.float32).permute(2, 0, 1).unsqueeze(0) / 255.0  # 1,3,h,w in [0,1]
+        t = F.interpolate(t, size=(sH, sW), mode="bicubic", align_corners=False).clamp_(0.0, 1.0)
+        l = (sW - tW) // 2
+        tt = (sH - tH) // 2
+        t = t[:, :, tt:tt + tH, l:l + tW].mul_(2.0).sub_(1.0)
+        out.append(t.to(dtype))
+    vid = torch.cat(out, 0).permute(1, 0, 2, 3).unsqueeze(0)  # 1 C F H W
+    return vid, tH, tW, padded
 
 
 def prepare_input_tensor(path: str, scale: float = 4, dtype=torch.bfloat16,
@@ -329,11 +538,12 @@ def prepare_input_tensor(path: str, scale: float = 4, dtype=torch.bfloat16,
 # --------------------------------------------------------------------------
 # 常驻 pipeline 初始化
 # --------------------------------------------------------------------------
-def init_pipeline(model_dir: Path, context_path: Path):
+def init_pipeline(model_dir: Path, context_path: Path) -> Any:
     logger.info("GPU: %s CUDA=%s", torch.cuda.get_device_name(0), torch.version.cuda)
     manager = ModelManager(torch_dtype=torch.bfloat16, device="cpu")
     manager.load_models([str(model_dir / "diffusion_pytorch_model_streaming_dmd.safetensors")])
-    pipe = FlashVSRTinyLongPipeline.from_model_manager(manager, device="cuda")
+    # diffsynth 的 pipeline 为动态第三方对象，内部属性/方法无类型信息，标 Any 以免误报。
+    pipe: Any = FlashVSRTinyLongPipeline.from_model_manager(manager, device="cuda")
 
     pipe.denoising_model().LQ_proj_in = Causal_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to("cuda", dtype=torch.bfloat16)
     lq_proj_path = model_dir / "LQ_proj_in.ckpt"
@@ -356,7 +566,7 @@ def init_pipeline(model_dir: Path, context_path: Path):
 # --------------------------------------------------------------------------
 # ffmpeg 编码 + 音轨 remux（参考 flashvsr-service）
 # --------------------------------------------------------------------------
-def probe_video_info(path: Path) -> dict[str, int]:
+def probe_video_info(path: Path) -> dict[str, Any]:
     completed = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
          "stream=width,height,nb_frames,avg_frame_rate,r_frame_rate", "-of", "json", str(path)],
@@ -369,10 +579,18 @@ def probe_video_info(path: Path) -> dict[str, int]:
         fps = max(1, int(round(float(Fraction(rate)))))
     except (ValueError, ZeroDivisionError):
         fps = 30
+    frames = 0
+    try:
+        frames = int(stream.get("nb_frames") or 0)
+    except (TypeError, ValueError):
+        frames = 0
+    duration = round(frames / fps, 3) if (fps > 0 and frames > 0) else None
     return {
         "width": int(stream["width"]),
         "height": int(stream["height"]),
         "fps": fps,
+        "frames": frames,
+        "duration_seconds": duration,
     }
 
 
@@ -494,6 +712,27 @@ def release_host_memory() -> None:
         pass
 
 
+def reclaim_gpu_memory() -> None:
+    """把 reserved-but-unused 的显存交还驱动。
+
+    每个任务（成功/失败/取消）结束后调用。失败任务由调用方先执行
+    ``traceback.clear_frames`` 清掉 traceback 对失败帧张量的引用，之后
+    ``empty_cache`` 才能把峰值分配交还驱动；否则一次 OOM 会把约峰值
+    （数十 GB）一直占在进程里，直到下一个任务才回收。
+    """
+    release_host_memory()
+    try:
+        if torch.cuda.is_available():
+            before = torch.cuda.memory_reserved() / 2**20
+            torch.cuda.empty_cache()
+            after = torch.cuda.memory_reserved() / 2**20
+            if before - after >= 1.0:
+                logger.info("reclaimed %.0fMB GPU cache (reserved %.0fMB -> %.0fMB)",
+                            before - after, before, after)
+    except Exception:
+        pass
+
+
 # --------------------------------------------------------------------------
 # 任务取消：推理/预处理/编码三个阶段在 chunk/帧循环中检查取消信号，
 # 命中即抛 InferenceCancelled，避免取消后仍跑完整迭代。
@@ -520,8 +759,10 @@ _real_tqdm = _ftl.tqdm
 
 
 class _ProgressTqdm:
-    def __init__(self, iterable=None, *args, **kwargs):
-        self._tqdm = _real_tqdm(iterable, *args, **kwargs)
+    def __init__(self, iterable: Any = None, *args, **kwargs) -> None:
+        # 屏蔽 pipeline 内部 tqdm 的绘制，只保留计数；进度统一由服务的单行进度条上报。
+        kwargs.pop("disable", None)
+        self._tqdm = _real_tqdm(iterable, *args, disable=True, **kwargs)
         try:
             _inference_progress.total = len(iterable)
         except TypeError:
@@ -553,6 +794,93 @@ class FlashVSRRuntime:
         self.jobs_completed = 0
         logger.info("runtime ready: load_seconds=%.3f", self.load_seconds)
 
+    def _run_tiled(
+        self,
+        source: Path,
+        scale: float,
+        sparse_ratio: float,
+        local_range: int,
+        seed: int,
+        tile_size: int,
+        tile_overlap: int,
+        report: Callable[[float, str], None],
+        cancel_check: Optional[Callable[[], bool]],
+    ):
+        """tiled_dit 路径：空间分块逐瓦片跑 DiT，再羽化融合为整幅输出。
+
+        返回 (generated C,F,H,W in [-1,1], target_h, target_w, frames, fps, timings, peak_allocated)。
+        """
+        stage = time.monotonic()
+        frames, w0, h0, fps, total = decode_source_frames(str(source), cancel_check)
+        _, _, target_w, target_h = compute_scaled_and_target_dims(w0, h0, scale=scale, multiple=128)
+        coords = calculate_tile_coords(h0, w0, tile_size, tile_overlap)
+        timings: dict[str, float] = {"prepare": round(time.monotonic() - stage, 3)}
+        logger.info("tiled_dit: src=%dx%d -> %dx%d frames=%d fps=%d tiles=%d (tile=%d overlap=%d)",
+                    w0, h0, target_w, target_h, total, fps, len(coords), tile_size, tile_overlap)
+
+        canvas = torch.zeros((total, target_h, target_w, 3), dtype=torch.float32)
+        weight = torch.zeros_like(canvas)
+        torch.cuda.reset_peak_memory_stats()
+        stage = time.monotonic()
+        num_tiles = len(coords)
+        _original_tqdm = _ftl.tqdm
+        _ftl.tqdm = _ProgressTqdm
+        try:
+            for ti, (x1, y1, x2, y2) in enumerate(coords):
+                if cancel_check is not None and cancel_check():
+                    raise InferenceCancelled("inference cancelled")
+                tile = frames[:, y1:y2, x1:x2, :]
+                lq, th, tw, padded = prepare_tile_lq(
+                    tile, scale=scale, dtype=torch.bfloat16, cancel_check=cancel_check)
+
+                def _tile_cb(frac: float, phase: str, _ti: int = ti) -> None:
+                    within = min(1.0, max(0.0, (frac - 10.0) / 80.0))
+                    report(10.0 + 80.0 * (_ti + within) / num_tiles, phase)
+
+                self.pipe.load_models_to_device(["dit", "vae"])
+                _inference_progress.cb = _tile_cb
+                _inference_progress.cancel_check = cancel_check
+                try:
+                    out = self.pipe(
+                        prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed,
+                        LQ_video=lq, num_frames=padded, height=th, width=tw,
+                        is_full_block=False, if_buffer=True,
+                        topk_ratio=sparse_ratio * 768 * 1280 / (th * tw),
+                        kv_ratio=3.0, local_range=local_range, color_fix=True,
+                    )
+                finally:
+                    _inference_progress.cb = None
+                    _inference_progress.cancel_check = None
+                torch.cuda.synchronize()
+
+                out = out[:, :total, :, :]                       # (C,F,th,tw) in [-1,1]
+                out_nhwc = out.permute(1, 2, 3, 0)               # (F,th,tw,C)
+                mask = create_feather_mask(
+                    (th, tw), int(round(tile_overlap * scale))).permute(0, 2, 3, 1)  # (1,th,tw,1)
+                ox, oy = int(round(x1 * scale)), int(round(y1 * scale))
+                h_ = min(th, target_h - oy)
+                w_ = min(tw, target_w - ox)
+                if h_ > 0 and w_ > 0:
+                    canvas[:, oy:oy + h_, ox:ox + w_, :] += out_nhwc[:, :h_, :w_, :] * mask[:, :h_, :w_, :]
+                    weight[:, oy:oy + h_, ox:ox + w_, :] += mask[:, :h_, :w_, :]
+                del lq, out, out_nhwc, tile
+                if hasattr(self.pipe.denoising_model(), "LQ_proj_in"):
+                    self.pipe.denoising_model().LQ_proj_in.clear_cache()
+                self.pipe.TCDecoder.clean_mem()
+                torch.cuda.empty_cache()
+                release_host_memory()
+        finally:
+            _ftl.tqdm = _original_tqdm
+        timings["inference"] = round(time.monotonic() - stage, 3)
+        peak_allocated = torch.cuda.max_memory_allocated()
+
+        weight.clamp_(min=1e-6)
+        canvas.div_(weight)
+        generated = canvas.permute(3, 0, 1, 2)  # (C,F,H,W) in [-1,1]
+        del canvas, weight, frames
+        release_host_memory()
+        return generated, target_h, target_w, total, fps, timings, peak_allocated
+
     def process(
         self,
         source: Path,
@@ -564,6 +892,9 @@ class FlashVSRRuntime:
         encoder: str = "auto",
         progress_cb: Optional[Callable[[float, str], None]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
+        tiled_dit: bool = False,
+        tile_size: int = 256,
+        tile_overlap: int = 24,
     ) -> dict:
         source = source.resolve()
         output = output.resolve()
@@ -585,35 +916,41 @@ class FlashVSRRuntime:
         lq_video = generated = None
         try:
             report(1.0, "preparing")
-            stage = time.monotonic()
-            lq_video, target_h, target_w, padded_frames, fps, original_frames = prepare_input_tensor(
-                str(source), scale=scale, dtype=torch.bfloat16, cancel_check=cancel_check
-            )
-            timings["prepare"] = round(time.monotonic() - stage, 3)
-            logger.info("job input=%s target=%dx%d frames=%d fps=%d", source, target_w, target_h, original_frames, fps)
-
-            torch.cuda.reset_peak_memory_stats()
-            stage = time.monotonic()
-            self.pipe.load_models_to_device(["dit", "vae"])
-            _original_tqdm = _ftl.tqdm
-            _ftl.tqdm = _ProgressTqdm
-            _inference_progress.cb = progress_cb
-            _inference_progress.cancel_check = cancel_check
-            try:
-                generated = self.pipe(
-                    prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed,
-                    LQ_video=lq_video, num_frames=padded_frames, height=target_h, width=target_w,
-                    is_full_block=False, if_buffer=True,
-                    topk_ratio=sparse_ratio * 768 * 1280 / (target_h * target_w),
-                    kv_ratio=3.0, local_range=local_range, color_fix=True,
+            if tiled_dit:
+                generated, target_h, target_w, original_frames, fps, t_timings, peak_allocated = self._run_tiled(
+                    source, scale, sparse_ratio, local_range, seed, tile_size, tile_overlap,
+                    report, cancel_check,
                 )
-            finally:
-                _ftl.tqdm = _original_tqdm
-                _inference_progress.cb = None
-                _inference_progress.cancel_check = None
-            torch.cuda.synchronize()
-            timings["inference"] = round(time.monotonic() - stage, 3)
-            peak_allocated = torch.cuda.max_memory_allocated()
+                timings.update(t_timings)
+            else:
+                stage = time.monotonic()
+                lq_video, target_h, target_w, padded_frames, fps, original_frames = prepare_input_tensor(
+                    str(source), scale=scale, dtype=torch.bfloat16, cancel_check=cancel_check
+                )
+                timings["prepare"] = round(time.monotonic() - stage, 3)
+
+                torch.cuda.reset_peak_memory_stats()
+                stage = time.monotonic()
+                self.pipe.load_models_to_device(["dit", "vae"])
+                _original_tqdm = _ftl.tqdm
+                _ftl.tqdm = _ProgressTqdm
+                _inference_progress.cb = progress_cb
+                _inference_progress.cancel_check = cancel_check
+                try:
+                    generated = self.pipe(
+                        prompt="", negative_prompt="", cfg_scale=1.0, num_inference_steps=1, seed=seed,
+                        LQ_video=lq_video, num_frames=padded_frames, height=target_h, width=target_w,
+                        is_full_block=False, if_buffer=True,
+                        topk_ratio=sparse_ratio * 768 * 1280 / (target_h * target_w),
+                        kv_ratio=3.0, local_range=local_range, color_fix=True,
+                    )
+                finally:
+                    _ftl.tqdm = _original_tqdm
+                    _inference_progress.cb = None
+                    _inference_progress.cancel_check = None
+                torch.cuda.synchronize()
+                timings["inference"] = round(time.monotonic() - stage, 3)
+                peak_allocated = torch.cuda.max_memory_allocated()
 
             # 模型输出帧数为 num_frames - 4（即 F-4，见官方 "8n-3" 注释）。向上补齐后
             # 输出帧数 >= 原始帧数，切除多余的补帧，使输出帧数严格等于输入帧数。
@@ -682,6 +1019,12 @@ class UpscaleRequest(BaseModel):
     sparse_ratio: float = Field(default=2.0, ge=0.5, le=4.0)
     local_range: int = Field(default=11, ge=3, le=33)
     encoder: Literal["auto", "libx264", "nvenc"] = "auto"
+    tiled_dit: Optional[bool] = Field(
+        default=None, description="空间分块跑 DiT 以降低显存峰值（较慢）；默认取服务端 FLASHVSR_TILED_DIT")
+    tile_size: Optional[int] = Field(
+        default=None, ge=64, le=2048, description="tiled_dit 瓦片边长（原始像素）；默认 FLASHVSR_TILE_SIZE")
+    tile_overlap: Optional[int] = Field(
+        default=None, ge=0, le=256, description="tiled_dit 瓦片重叠像素；默认 FLASHVSR_TILE_OVERLAP")
 
 
 class Worker:
@@ -724,12 +1067,17 @@ class Worker:
             "created_at": _to_unix(job.get("created_at")),
             "started_at": _to_unix(job.get("started_at")),
             "finished_at": _to_unix(job.get("finished_at")),
+            "queue_seconds": self._queue_seconds(job),
+            "elapsed_seconds": self._elapsed(job),
+            "total_seconds": self._total_seconds(job),
             "request": dict(job.get("request") or {}),
             "result": dict(job["result"]) if isinstance(job.get("result"), dict) else None,
             "error": job.get("error"),
         }
         if payload["status"] == "queued":
-            queued = [jid for jid in list(self.queue._queue) if self.jobs.get(jid, {}).get("status") == "queued"]
+            # asyncio.Queue 没有获取待处理项公开接口；_queue 稳定可用。
+            queued = [jid for jid in list(self.queue._queue)  # pyright: ignore[reportAttributeAccessIssue]
+                      if self.jobs.get(jid, {}).get("status") == "queued"]
             try:
                 payload["queue_position"] = queued.index(job["id"]) + 1
             except ValueError:
@@ -748,12 +1096,19 @@ class Worker:
             "phase": job.get("phase"),
             "progress": job.get("progress", 0.0),
             "scale": request.get("scale"),
+            "source_width": request.get("source_width"),
+            "source_height": request.get("source_height"),
+            "source_frames": request.get("source_frames"),
+            "source_fps": request.get("source_fps"),
+            "source_duration_seconds": request.get("source_duration_seconds"),
             "target_width": request.get("target_width"),
             "target_height": request.get("target_height"),
             "created_at": _to_unix(job.get("created_at")),
             "started_at": _to_unix(job.get("started_at")),
             "finished_at": _to_unix(job.get("finished_at")),
+            "queue_seconds": self._queue_seconds(job),
             "elapsed_seconds": self._elapsed(job),
+            "total_seconds": self._total_seconds(job),
             "error": error.get("message") if isinstance(error, dict) else error,
         }
 
@@ -770,13 +1125,29 @@ class Worker:
         result = job.get("result")
         if isinstance(result, dict) and result.get("elapsed_seconds") is not None:
             return round(float(result["elapsed_seconds"]), 1)
-        started = job.get("started_at")
-        if not started:
+        started = _epoch(job.get("started_at"))
+        if started is None:
             return None
-        try:
-            return round(time.time() - datetime.fromisoformat(str(started)).timestamp(), 1)
-        except (ValueError, TypeError):
+        finished = _epoch(job.get("finished_at"))
+        end = finished if finished is not None else time.time()
+        return round(max(0.0, end - started), 1)
+
+    @staticmethod
+    def _queue_seconds(job: dict[str, Any]) -> Optional[float]:
+        created = _epoch(job.get("created_at"))
+        started = _epoch(job.get("started_at"))
+        if created is None or started is None:
             return None
+        return round(max(0.0, started - created), 1)
+
+    @staticmethod
+    def _total_seconds(job: dict[str, Any]) -> Optional[float]:
+        created = _epoch(job.get("created_at"))
+        if created is None:
+            return None
+        finished = _epoch(job.get("finished_at"))
+        end = finished if finished is not None else time.time()
+        return round(max(0.0, end - created), 1)
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
@@ -813,18 +1184,25 @@ class Worker:
                 raise OpenAIHTTPException(404, "source path not found", type="not_found_error", param="source", code="source_not_found")
             source_provider = "path"
 
+        source_fps: Optional[float] = None
+        source_frames: Optional[int] = None
+        source_duration_seconds: Optional[float] = None
         if source.is_file():
             try:
                 info = await asyncio.to_thread(probe_video_info, source)
             except (subprocess.CalledProcessError, KeyError, ValueError):
                 raise OpenAIHTTPException(400, "cannot read video dimensions", param="file_id")
             source_width, source_height = info["width"], info["height"]
+            source_fps = float(info.get("fps") or 0.0) or None
+            source_frames = int(info.get("frames") or 0) or None
+            source_duration_seconds = info.get("duration_seconds")
         else:
             paths0 = list_images_natural(str(source))
             if not paths0:
                 raise OpenAIHTTPException(404, "no images in directory", type="not_found_error", param="source")
             with Image.open(paths0[0]) as img:
                 source_width, source_height = img.size
+            source_frames = len(paths0)
 
         _, _, target_width, target_height = scaled_dimensions(source_width, source_height, request.scale)
         target_pixels = target_width * target_height
@@ -863,8 +1241,15 @@ class Worker:
                 "sparse_ratio": request.sparse_ratio,
                 "local_range": request.local_range,
                 "encoder": request.encoder,
+                "tiled_dit": TILED_DIT if request.tiled_dit is None else bool(request.tiled_dit),
+                "tile_size": TILE_SIZE if request.tile_size is None else int(request.tile_size),
+                "tile_overlap": TILE_OVERLAP if request.tile_overlap is None else int(request.tile_overlap),
+                "source_name": source.name,
                 "source_width": source_width,
                 "source_height": source_height,
+                "source_frames": source_frames,
+                "source_fps": source_fps,
+                "source_duration_seconds": source_duration_seconds,
                 "target_width": target_width,
                 "target_height": target_height,
             },
@@ -874,8 +1259,16 @@ class Worker:
         self.jobs[job_id] = job
         self.persist(job)
         await self.queue.put(job_id)
-        logger.info("job %s queued: scale=%.1f target=%dx%d input=%s output=%s",
-                    job_id, request.scale, target_width, target_height, source, output)
+        req = job["request"]
+        logger.info(
+            "job %s queued: scale=%s seed=%s sparse_ratio=%s local_range=%s encoder=%s "
+            "tiled_dit=%s tile_size=%s tile_overlap=%s | input=%s (%sx%s, %s frames, %s fps, %s s) "
+            "| target=%sx%s | out=%s",
+            job_id, req["scale"], req["seed"], req["sparse_ratio"], req["local_range"], req["encoder"],
+            req["tiled_dit"], req["tile_size"], req["tile_overlap"],
+            source, source_width, source_height, source_frames, source_fps, source_duration_seconds,
+            target_width, target_height, output,
+        )
         return self.public(job)
 
     def _maybe_cleanup_input(self, job: dict[str, Any]) -> None:
@@ -909,22 +1302,40 @@ class Worker:
                 finished = self.jobs.get(job_id)
                 if finished and finished.get("status") in TERMINAL:
                     self._maybe_cleanup_input(finished)
+                # execute() 已返回，失败任务的异常 traceback 也已清帧，此时可把
+                # 峰值分配交还驱动（否则会在进程里一直占着）。
+                reclaim_gpu_memory()
 
     async def execute(self, job: dict[str, Any]) -> None:
         started = time.monotonic()
         job.update(status="running", phase="preparing", progress=1.0, started_at=now_iso(), error=None)
         self.persist(job)
         request = job["request"]
-        logger.info("job %s started: scale=%.1f target=%dx%d",
-                    job["id"], request.get("scale", 0), request.get("target_width"), request.get("target_height"))
+        logger.info("job %s started", job["id"])
+
+        _log_state = {"t": time.monotonic(), "p": -100.0}
 
         def on_progress(progress: float, phase: str) -> None:
+            if job.get("status") == "cancelled":
+                return  # 取消后迟到的进度回调不应把 phase 改回去
             job["progress"] = round(float(progress), 1)
             job["phase"] = phase
+            now = time.monotonic()
+            if _IS_TTY:
+                # 终端：单行原地刷新（含进度条），长任务不刷屏。
+                _write_progress_line(_format_progress(job["id"], phase, progress, now - started))
+            elif now - _log_state["t"] >= 15.0 or abs(progress - _log_state["p"]) >= 5.0:
+                # 非终端（重定向到文件/管道）：保留周期性日志行。至少每 15s
+                # 或进度跳变 >=5% 打印一次，长任务不会看起来卡死。
+                _log_state["t"] = now
+                _log_state["p"] = progress
+                logger.info("job %s %s %.1f%% (elapsed %.0fs)",
+                            job["id"], phase, progress, now - started)
 
         def cancelled() -> bool:
             return job.get("status") == "cancelled"
 
+        assert self.runtime is not None  # 生命周期内由 start() 初始化
         try:
             result = await asyncio.to_thread(
                 self.runtime.process,
@@ -937,6 +1348,9 @@ class Worker:
                 str(request.get("encoder", "auto")),
                 on_progress,
                 cancelled,
+                bool(request.get("tiled_dit", TILED_DIT)),
+                int(request.get("tile_size", TILE_SIZE)),
+                int(request.get("tile_overlap", TILE_OVERLAP)),
             )
         except InferenceCancelled:
             Path(job["output_path"]).unlink(missing_ok=True)
@@ -948,6 +1362,11 @@ class Worker:
                 logger.info("job %s cancelled during execution", job["id"])
                 return
             err_msg = str(exc) or type(exc).__name__
+            # traceback 会一直引用失败帧的局部张量（asyncio 的 executor future
+            # 在处理器返回后仍持有它），只 empty_cache 无法释放峰值；先清帧掉这些
+            # 引用，随后 run_loop 的 reclaim_gpu_memory() 才能交还驱动。
+            if exc.__traceback__ is not None:
+                traceback.clear_frames(exc.__traceback__)
             job.update(status="failed", phase="failed", finished_at=now_iso(),
                        error={"message": err_msg, "type": "inference_error", "param": None, "code": None})
             self.persist(job)
@@ -1188,7 +1607,86 @@ async def download_upscale(upscale_id: str):
     return FileResponse(job["output_path"], media_type="video/mp4", filename=f"flashvsr_{upscale_id}.mp4")
 
 
+# --------------------------------------------------------------------------
+# 配置解析：命令行参数与同名环境变量兼容，优先级 命令行 > 环境变量 > 默认值
+# --------------------------------------------------------------------------
+def _env(name: str, default: str) -> str:
+    return os.environ.get(name, default)
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="infer_server.py",
+        description="FlashVSR 常驻视频超分服务（OpenAI 兼容 API）",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--host", default=_env("FLASHVSR_HOST", "0.0.0.0"),
+                        help="监听地址（FLASHVSR_HOST）")
+    parser.add_argument("--port", type=int, default=int(_env("FLASHVSR_PORT", "18302")),
+                        help="监听端口（FLASHVSR_PORT）")
+    parser.add_argument("--api-key", default=_env("FLASHVSR_API_KEY", ""),
+                        help="Bearer 鉴权 Key，留空则不鉴权（FLASHVSR_API_KEY）")
+    parser.add_argument("--model-dir", default=_env("FLASHVSR_MODEL_DIR", str(DEFAULT_MODEL_DIR)),
+                        help="模型权重目录（FLASHVSR_MODEL_DIR）")
+    parser.add_argument("--work-dir", default=_env("FLASHVSR_WORK_DIR", str(BASE_DIR / ".flashvsr_server")),
+                        help="输入/任务工作目录（FLASHVSR_WORK_DIR）")
+    parser.add_argument("--output-dir", default=os.environ.get("FLASHVSR_OUTPUT_DIR", ""),
+                        help="超分结果输出目录，默认 <work-dir>/outputs（FLASHVSR_OUTPUT_DIR）")
+    parser.add_argument("--encoder", default=_env("FLASHVSR_ENCODER", "auto"),
+                        choices=["auto", "nvenc", "libx264"],
+                        help="视频编码器（FLASHVSR_ENCODER）")
+    parser.add_argument("--max-queue", type=int, default=int(_env("FLASHVSR_MAX_QUEUE", "8")),
+                        help="最大排队任务数（FLASHVSR_MAX_QUEUE）")
+    parser.add_argument("--max-target-pixels", type=int,
+                        default=int(_env("FLASHVSR_MAX_TARGET_PIXELS", "14500000")),
+                        help="目标像素安全上限，防 OOM（FLASHVSR_MAX_TARGET_PIXELS）")
+    parser.add_argument("--tiled-dit", action="store_true", default=_env("FLASHVSR_TILED_DIT", "0") == "1",
+                        help="默认启用 tiled_dit 空间分块降显存（FLASHVSR_TILED_DIT=1）")
+    parser.add_argument("--tile-size", type=int, default=int(_env("FLASHVSR_TILE_SIZE", "256")),
+                        help="tiled_dit 瓦片边长（原始像素）（FLASHVSR_TILE_SIZE）")
+    parser.add_argument("--tile-overlap", type=int, default=int(_env("FLASHVSR_TILE_OVERLAP", "24")),
+                        help="tiled_dit 瓦片重叠像素（FLASHVSR_TILE_OVERLAP）")
+    parser.add_argument("--encode-chunk", type=int, default=int(_env("FLASHVSR_ENCODE_CHUNK", "4")),
+                        help="编码时每次写入 ffmpeg 的帧数（FLASHVSR_ENCODE_CHUNK）")
+    parser.add_argument("--log-level", type=str.upper,
+                        default=_env("FLASHVSR_LOG_LEVEL", "INFO").upper(),
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                        help="日志级别（FLASHVSR_LOG_LEVEL）")
+    return parser
+
+
+def apply_config(args: argparse.Namespace) -> None:
+    """把解析后的配置写回模块全局，并重建依赖这些配置的派生状态。"""
+    global HOST, PORT, API_KEY, MODEL_DIR, WORK_DIR, OUTPUT_DIR, ENCODER
+    global MAX_QUEUE, MAX_TARGET_PIXELS, ENCODE_CHUNK, TILED_DIT, TILE_SIZE, TILE_OVERLAP
+    global INPUT_DIR, JOB_DIR, FILE_META_DIR, worker
+
+    HOST = args.host
+    PORT = args.port
+    API_KEY = args.api_key
+    MODEL_DIR = Path(args.model_dir)
+    WORK_DIR = Path(args.work_dir)
+    OUTPUT_DIR = Path(args.output_dir) if args.output_dir else WORK_DIR / "outputs"
+    ENCODER = args.encoder
+    MAX_QUEUE = args.max_queue
+    MAX_TARGET_PIXELS = args.max_target_pixels
+    ENCODE_CHUNK = args.encode_chunk
+    TILED_DIT = bool(args.tiled_dit)
+    TILE_SIZE = int(args.tile_size)
+    TILE_OVERLAP = int(args.tile_overlap)
+
+    INPUT_DIR = WORK_DIR / "inputs"
+    JOB_DIR = WORK_DIR / "jobs"
+    FILE_META_DIR = WORK_DIR / "file_meta"
+    for directory in (INPUT_DIR, OUTPUT_DIR, JOB_DIR, FILE_META_DIR):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    logger.setLevel(args.log_level)
+    worker = Worker()
+
+
 if __name__ == "__main__":
+    apply_config(build_arg_parser().parse_args())
     uvicorn.run(app,
                 host=HOST,
                 port=PORT,

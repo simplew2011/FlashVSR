@@ -198,6 +198,8 @@ def init_pipeline():
     return pipe
 
 def main():
+    t0 = time.time()
+
     RESULT_ROOT = "./results"
     os.makedirs(RESULT_ROOT, exist_ok=True)
     inputs = [
@@ -230,6 +232,13 @@ def main():
         save_video(video, os.path.join(RESULT_ROOT, f"FlashVSR_Tiny_Long_{name.split('.')[0]}_seed{seed}.mp4"), fps=fps, quality=5)
 
     print("Done.")
+    print(f"Done. time: {time.time() - t0}")
 
 if __name__ == "__main__":
     main()
+
+
+'''
+CUDA_VISIBLE_DEVICES=2 python infer_flashvsr_tiny_long_video.py
+Done. time: 1071.172466993332
+'''
